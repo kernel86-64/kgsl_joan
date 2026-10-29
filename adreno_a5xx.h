@@ -301,8 +301,14 @@ int a5xx_ringbuffer_submitcmd(struct adreno_device *adreno_dev,
 int a5xx_ringbuffer_submit(struct adreno_ringbuffer *rb,
 		struct adreno_submit_time *time, bool sync);
 
+extern int kgsl_joan_gpmu;
+
 static inline bool a5xx_has_gpmu(struct adreno_device *adreno_dev)
 {
+	/* joan bring-up: joan_gpmu=0 runs the A540 without its GPMU */
+	if (adreno_is_a540(adreno_dev) && !kgsl_joan_gpmu)
+		return false;
+
 	return (adreno_is_a530(adreno_dev) || adreno_is_a540(adreno_dev));
 }
 

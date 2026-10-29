@@ -26,5 +26,6 @@ void kgsl_icc_set_tag(struct kgsl_pwrctrl *pwr, int buslevel);
 
 u32 *kgsl_bus_get_table(struct platform_device *pdev,
 		const char *name, int *count);
+int kgsl_bus_get_fallback_level(unsigned long freq, u32 *bus, u32 *min, u32 *max);
 
 #endif

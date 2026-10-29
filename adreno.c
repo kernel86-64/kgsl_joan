@@ -34,10 +34,12 @@
 #endif
 
 #include "adreno.h"
+#include "kgsl_joan_trace.h"
 #include "adreno_a6xx.h"
 #include "adreno_compat.h"
 #include "adreno_pm4types.h"
 #include "adreno_trace.h"
+#include "kgsl_a540_rail.h"
 #include "kgsl_bus.h"
 #include "kgsl_gmu_core.h"
 #include "kgsl_power_trace.h"
@@ -281,6 +283,7 @@ int adreno_get_firmware(struct adreno_device *adreno_dev,
 int adreno_zap_shader_load(struct adreno_device *adreno_dev,
 		const char *name)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct device_node *np, *mem_np;
 	struct device *dev = &device->pdev->dev;
@@ -366,7 +369,9 @@ int adreno_zap_shader_load(struct adreno_device *adreno_dev,
 		goto out;
 	}
 
+	JTRACE("zap: pas_auth_and_reset");
 	ret = kgsl_pas_auth_and_reset(GPU_PASID);
+	JTRACE("zap: pas_auth_and_reset returned %d", ret);
 
 out:
 	if (mem_region)
@@ -753,6 +758,23 @@ _get_gpu_core_standard(struct platform_device *pdev, u32 *chipid)
 		}
 	}
 
+	/*
+	 * Older targets (a5xx and earlier) describe their revision with
+	 * core/major/minor/patchid fields, possibly ANY_ID, instead of chipid.
+	 */
+	for (i = 0; i < ARRAY_SIZE(adreno_gpulist); i++) {
+		if (adreno_gpulist[i]->chipid)
+			continue;
+
+		if (ADRENO_CHIPID_CORE(lookup_chipid) == adreno_gpulist[i]->core &&
+			_rev_match(ADRENO_CHIPID_MAJOR(lookup_chipid), adreno_gpulist[i]->major) &&
+			_rev_match(ADRENO_CHIPID_MINOR(lookup_chipid), adreno_gpulist[i]->minor) &&
+			_rev_match(ADRENO_CHIPID_PATCH(lookup_chipid), adreno_gpulist[i]->patchid)) {
+			*chipid = lookup_chipid;
+			return adreno_gpulist[i];
+		}
+	}
+
 	return NULL;
 }
 
@@ -889,6 +911,9 @@ adreno_identify_gpu(struct platform_device *pdev, u32 *chipid)
 
 	return gpucore;
 }
+
+static bool adreno_bind_direct(struct device *dev);
+extern int kgsl_joan_va64;
 
 static const struct of_device_id adreno_match_table[] = {
 	{ .compatible = "qcom,kgsl-3d0", .data = &device_3d0 },
@@ -1210,6 +1235,12 @@ static int adreno_parse_ib_votes(struct kgsl_device *device,
 		return 0;
 	}
 
+	if (!kgsl_bus_get_fallback_level(dev_pm_opp_get_freq(opp), &level->bus_freq,
+			&level->bus_min, &level->bus_max)) {
+		of_node_put(child);
+		return 0;
+	}
+
 	/* Neither "qcom,bus-freq" nor "opp-peak-kBps" was found */
 	dev_err(device->dev, "%pOF: Missing bus frequency properties\n", child);
 	of_node_put(child);
@@ -1243,6 +1274,60 @@ static int adreno_parse_opp_node(struct kgsl_device *device,
 	return 0;
 }
 
+/*
+ * Standard msm8998 bindings: the GPU OPPs vote VDD_MX through required-opps
+ * and VDD_GFX through vdd-supply, and the joan rail helper adds MEM-ACC
+ * sequencing to the core clock. Set all of that up the way drm/msm does,
+ * before the OPP table is populated.
+ */
+static int adreno_a540_opp_setup(struct kgsl_device *device)
+{
+	static const char * const mx_name[] = { "mx" };
+	static const char * const vdd_name[] = { "vdd", NULL };
+	const struct dev_pm_domain_attach_data mx_data = {
+		.pd_names = mx_name,
+		.num_pd_names = ARRAY_SIZE(mx_name),
+		.pd_flags = PD_FLAG_NO_DEV_LINK | PD_FLAG_REQUIRED_OPP,
+	};
+	struct device *dev = &device->pdev->dev;
+	struct dev_pm_domain_list *mx_list;
+	u32 speedbin, supp_hw = 0x80;
+	int ret;
+
+	/*
+	 * Every OPP carries opp-supported-hw, so the table stays empty unless a
+	 * mask is set. Like drm/msm's check_speed_bin(), use the fused bin when
+	 * DT has the cell, else a bit that selects the default frequencies.
+	 */
+	if (!adreno_read_speed_bin(device->pdev, &speedbin))
+		supp_hw = BIT(speedbin & 0xff);
+
+	ret = devm_pm_opp_set_supported_hw(dev, &supp_hw, 1);
+	if (ret)
+		return dev_err_probe(dev, ret, "Unable to set the OPP supported hardware\n");
+
+	if (of_property_match_string(dev->of_node, "power-domain-names", "mx") >= 0) {
+		ret = devm_pm_domain_attach_list(dev, &mx_data, &mx_list);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "Unable to attach the MX power domain\n");
+		device->pwrctrl.mx_pd = mx_list->pd_devs[0];
+	}
+
+	ret = kgsl_a540_gfx_set_opp_config(dev);
+	if (ret == -ENOENT)
+		ret = devm_pm_opp_set_clkname(dev, "core");
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "Unable to set the OPP clock\n");
+
+	if (device_property_present(dev, "vdd-supply")) {
+		ret = devm_pm_opp_set_regulators(dev, vdd_name);
+		if (ret)
+			return dev_err_probe(dev, ret, "Unable to register the OPP regulator\n");
+	}
+
+	return 0;
+}
+
 static int adreno_of_parse_pwrlevels(struct adreno_device *adreno_dev)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
@@ -1253,8 +1338,13 @@ static int adreno_of_parse_pwrlevels(struct adreno_device *adreno_dev)
 	unsigned long freq = ULONG_MAX;
 	int ret;
 
-	/* Only handle the core clock for no GMU and RGMU targets */
-	if (is_gmu_wrapper_available() || ADRENO_GPUREV(adreno_dev) == ADRENO_REV_A612) {
+	if (ADRENO_GPUREV(adreno_dev) == ADRENO_REV_A540 && adreno_bind_direct(dev)) {
+		ret = adreno_a540_opp_setup(device);
+		if (ret)
+			return ret;
+	} else if (adreno_bind_direct(dev) ||
+			ADRENO_GPUREV(adreno_dev) == ADRENO_REV_A612) {
+		/* Only handle the core clock for no GMU and RGMU targets */
 		/*
 		 * This can only be done before devm_pm_opp_of_add_table(), or
 		 * dev_pm_opp_set_config() will WARN_ON()
@@ -1280,6 +1370,9 @@ static int adreno_of_parse_pwrlevels(struct adreno_device *adreno_dev)
 		dev_err(dev, "Unable to initialize opp table from device tree\n");
 		return ret;
 	}
+
+	if (ADRENO_GPUREV(adreno_dev) == ADRENO_REV_A540)
+		kgsl_a540_gfx_apply_open_loop(dev);
 
 	ret = dev_pm_opp_of_find_icc_paths(dev, NULL);
 	if (ret) {
@@ -1854,6 +1947,31 @@ static const struct of_device_id adreno_component_match_legacy[] = {
 	{},
 };
 
+/*
+ * With standard DT bindings there are no components to wait for when the GPU
+ * has no GMU: either a GMU wrapper node stands in for it, or (a5xx and older)
+ * there is no GMU or RGMU node at all. Bind such targets directly.
+ */
+static bool adreno_bind_direct(struct device *dev)
+{
+	struct device_node *node;
+
+	if (is_gmu_wrapper_available())
+		return true;
+
+	if (!of_device_is_compatible(dev->of_node, "qcom,adreno"))
+		return false;
+
+	for_each_matching_node(node, adreno_component_match) {
+		if (of_device_is_available(node)) {
+			of_node_put(node);
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static int adreno_irq_setup(struct platform_device *pdev,
 		struct adreno_device *adreno_dev)
 {
@@ -2057,12 +2175,12 @@ static inline u32 ubwc_encoder_to_kgsl_mode(u32 enc_version)
 
 static int adreno_init_ubwc(struct adreno_device *adreno_dev)
 {
-	struct qcom_ubwc_cfg_data *cfg = qcom_ubwc_config_get_data();
+	const struct qcom_ubwc_cfg_data *cfg = qcom_ubwc_config_get_data();
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	int ret = 0;
 
 	if (cfg) {
-		adreno_dev->ubwc_cfg_data = cfg;
+		adreno_dev->ubwc_cfg_data = (void *)cfg;
 		adreno_dev->ubwc_mode = ubwc_encoder_to_kgsl_mode(cfg->ubwc_enc_version);
 		adreno_dev->highest_bank_bit = cfg->highest_bank_bit;
 	} else
@@ -2099,7 +2217,7 @@ static int adreno_bind_components(struct device *dev)
 	 * Note: with standard DT bindings, there are no components to bind
 	 * for no GMU targets, so skip invoking component_bind_all in this case.
 	 */
-	if (!is_gmu_wrapper_available())
+	if (!adreno_bind_direct(dev))
 		return component_bind_all(dev, NULL);
 
 	return 0;
@@ -2124,6 +2242,10 @@ int adreno_device_probe(struct platform_device *pdev,
 	device->pdev = pdev;
 
 	adreno_update_soc_hw_revision_quirks(adreno_dev, pdev);
+
+	/* drm/msm and the vendor DT both set this for the A540 */
+	if (adreno_is_a540(adreno_dev))
+		adreno_dev->quirks |= ADRENO_QUIRK_DISABLE_LMLOADKILL;
 
 	/*
 	 * Add kgsl_3d0_reg_memory and cx_mem/cx_misc region early
@@ -2158,7 +2280,7 @@ int adreno_device_probe(struct platform_device *pdev,
 	 * that we cannot use 64 bit virtual addresses on a 32 bit kernel even
 	 * though the hardware and the rest of the KGSL driver supports it.
 	 */
-	if (adreno_support_64bit(adreno_dev))
+	if (adreno_support_64bit(adreno_dev) && kgsl_joan_va64)
 		kgsl_mmu_set_feature(device, KGSL_MMU_64BIT);
 
 	/*
@@ -2669,6 +2791,7 @@ err:
 
 static int adreno_first_open(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	const struct adreno_power_ops *ops = ADRENO_POWER_OPS(adreno_dev);
 
@@ -2686,6 +2809,7 @@ static int adreno_close(struct adreno_device *adreno_dev)
 
 static int adreno_last_close(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	const struct adreno_power_ops *ops = ADRENO_POWER_OPS(adreno_dev);
 
@@ -2865,6 +2989,7 @@ u32 adreno_get_ahb_timeout_val(struct adreno_device *adreno_dev, u32 noc_timeout
  */
 static int _adreno_start(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	const struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
 	int status;
@@ -2903,11 +3028,13 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 		goto error_pwr_off;
 
 	/* Re-initialize the coresight registers if applicable */
-	adreno_coresight_start(adreno_dev);
+	if (kgsl_joan_perf)
+		adreno_coresight_start(adreno_dev);
 
 	adreno_irqctrl(adreno_dev, 1);
 
-	adreno_perfcounter_start(adreno_dev);
+	if (kgsl_joan_perf)
+		adreno_perfcounter_start(adreno_dev);
 
 	/* Clear FSR here in case it is set from a previous pagefault */
 	kgsl_mmu_clear_fsr(&device->mmu);
@@ -2965,6 +3092,7 @@ error_pwr_off:
  */
 int adreno_start(struct kgsl_device *device, int priority)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	int nice = task_nice(current);
 	int ret;
@@ -2982,6 +3110,7 @@ int adreno_start(struct kgsl_device *device, int priority)
 
 static int adreno_stop(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	const struct adreno_gpudev *gpudev = ADRENO_GPU_DEVICE(adreno_dev);
 	int error = 0;
@@ -4397,6 +4526,7 @@ int adreno_power_cycle_u32(struct adreno_device *adreno_dev,
 
 static int adreno_set_opp(struct kgsl_device *device, struct kgsl_pwrlevel *level)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct device *dev = &device->pdev->dev;
 	int ret;
 
@@ -4780,7 +4910,7 @@ static int adreno_probe(struct platform_device *pdev)
 	 * from adreno_component_match list for no GMU targets. Invoke
 	 * adreno_bind directly in this case.
 	 */
-	if (is_gmu_wrapper_available())
+	if (adreno_bind_direct(&pdev->dev))
 		return adreno_bind(&pdev->dev);
 
 	adreno_add_components(&pdev->dev, &match, matches);
@@ -4795,7 +4925,7 @@ static int adreno_probe(struct platform_device *pdev)
 #if (KERNEL_VERSION(6, 10, 0) <= LINUX_VERSION_CODE)
 static void adreno_remove(struct platform_device *pdev)
 {
-	if (is_gmu_wrapper_available())
+	if (adreno_bind_direct(&pdev->dev))
 		adreno_unbind(&pdev->dev);
 	else
 		component_master_del(&pdev->dev, &adreno_ops);
@@ -4803,7 +4933,7 @@ static void adreno_remove(struct platform_device *pdev)
 #else
 static int adreno_remove(struct platform_device *pdev)
 {
-	if (is_gmu_wrapper_available())
+	if (adreno_bind_direct(&pdev->dev))
 		adreno_unbind(&pdev->dev);
 	else
 		component_master_del(&pdev->dev, &adreno_ops);
@@ -5082,6 +5212,29 @@ static void __exit kgsl_3d_exit(void)
 }
 
 module_param_named(preempt_enable, adreno_preemption_enable, bool, 0600);
+
+/* joan bring-up: delay in ms after each JTRACE marker, 0 disables them */
+int kgsl_joan_trace = 20;
+module_param_named(joan_trace, kgsl_joan_trace, int, 0644);
+
+int kgsl_joan_gpmu = 1;
+module_param_named(joan_gpmu, kgsl_joan_gpmu, int, 0644);
+
+/* joan bring-up: joan_va64=0 keeps the 32-bit GPU address layout */
+int kgsl_joan_va64 = 1;
+module_param_named(joan_va64, kgsl_joan_va64, int, 0644);
+
+/* joan bring-up: joan_perf=0 skips perfcounter and coresight setup at start */
+int kgsl_joan_perf = 1;
+module_param_named(joan_perf, kgsl_joan_perf, int, 0644);
+
+/* joan bring-up: joan_zapresume=1 resumes the zap image drm/msm loaded */
+int kgsl_joan_zapresume;
+module_param_named(joan_zapresume, kgsl_joan_zapresume, int, 0644);
+
+/* joan bring-up: joan_ringdump=1 logs every dword submitted to the ring */
+int kgsl_joan_ringdump;
+module_param_named(joan_ringdump, kgsl_joan_ringdump, int, 0644);
 MODULE_PARM_DESC(preempt_enable, "Enable GPU HW Preemption");
 
 module_param_named(gpu_sku_override, kgsl_gpu_sku_override, uint, 0600);

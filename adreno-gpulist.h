@@ -452,8 +452,12 @@ static const struct kgsl_regmap_list a540_vbif_regs[] = {
 static const struct adreno_a5xx_core adreno_gpu_core_a540v2 = {
 	.base = {
 		DEFINE_ADRENO_REV(ADRENO_REV_A540, 5, 4, 0, ANY_ID),
-		.features = ADRENO_PREEMPTION |
-			ADRENO_CONTENT_PROTECTION |
+		/*
+		 * No preemption: its records are privileged buffers, and a5xx
+		 * has no APRIV, so the CP's accesses to them fault and the
+		 * preemption init in a5xx_post_start() never idles.
+		 */
+		.features = ADRENO_CONTENT_PROTECTION |
 			ADRENO_SPTP_PC,
 		.gpudev = &adreno_a5xx_gpudev,
 		.perfcounters = &adreno_a5xx_perfcounters,

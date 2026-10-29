@@ -8,6 +8,7 @@
 #include <linux/compat.h>
 #include <linux/io.h>
 #include <linux/of_device.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/scatterlist.h>
 #include <linux/qcom-iommu-util.h>
@@ -32,6 +33,7 @@
 #include "adreno.h"
 #include "kgsl_device.h"
 #include "kgsl_iommu.h"
+#include "kgsl_joan_trace.h"
 #include "kgsl_mmu.h"
 #include "kgsl_pwrctrl.h"
 #include "kgsl_sharedmem.h"
@@ -362,6 +364,7 @@ static size_t _iopgtbl_map_sg(struct kgsl_iommu_pt *pt, u64 gpuaddr,
 
 static void kgsl_iommu_send_tlb_hint(struct kgsl_mmu *mmu, bool hint)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_device *device = KGSL_MMU_DEVICE(mmu);
 	struct kgsl_iommu *iommu = &mmu->iommu;
 
@@ -530,7 +533,9 @@ static int _iommu_unmap(struct iommu_domain *domain, u64 addr, size_t size)
 	if (addr & (1ULL << 48))
 		addr |= 0xffff000000000000;
 
+	JTRACE("iommu_unmap 0x%llx+0x%zx from %ps", addr, size, __builtin_return_address(0));
 	unmapped = iommu_unmap(domain, addr, size);
+	JTRACE("iommu_unmap done");
 
 	return (unmapped == size) ? 0 : -ENOMEM;
 }
@@ -578,7 +583,12 @@ static ssize_t _iommu_map_sg(struct iommu_domain *domain, u64 gpuaddr,
 	if (gpuaddr & (1ULL << 48))
 		gpuaddr |= 0xffff000000000000;
 
-	return kgsl_mmu_map_sg(domain, gpuaddr, sgt->sgl, sgt->orig_nents, prot);
+	ssize_t ret;
+
+	JTRACE("iommu_map_sg 0x%llx prot 0x%x from %ps", gpuaddr, prot, __builtin_return_address(0));
+	ret = kgsl_mmu_map_sg(domain, gpuaddr, sgt->sgl, sgt->orig_nents, prot);
+	JTRACE("iommu_map_sg done %zd", ret);
+	return ret;
 }
 
 static int
@@ -666,6 +676,7 @@ static int _kgsl_iommu_unmap(struct iommu_domain *domain,
 static int kgsl_iommu_default_map(struct kgsl_pagetable *pagetable,
 		struct kgsl_memdesc *memdesc)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_mmu *mmu = pagetable->mmu;
 	struct kgsl_iommu *iommu = &mmu->iommu;
 	struct iommu_domain *domain, *lpac;
@@ -709,6 +720,7 @@ static int kgsl_iommu_secure_unmap(struct kgsl_pagetable *pagetable,
 static int kgsl_iommu_default_unmap(struct kgsl_pagetable *pagetable,
 		struct kgsl_memdesc *memdesc)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_mmu *mmu = pagetable->mmu;
 	struct kgsl_iommu *iommu = &mmu->iommu;
 	int ret;
@@ -743,8 +755,10 @@ static void __iomem *kgsl_iommu_reg(struct kgsl_iommu_context *ctx,
 	struct kgsl_iommu *iommu = KGSL_IOMMU(ctx->kgsldev);
 
 	if (!iommu->cb0_offset) {
-		u32 reg =
-			readl_relaxed(iommu->regbase + KGSL_IOMMU_IDR1_OFFSET);
+		u32 reg;
+
+		JTRACE("smmu global read IDR1");
+		reg = readl_relaxed(iommu->regbase + KGSL_IOMMU_IDR1_OFFSET);
 
 		iommu->pagesize =
 			FIELD_GET(IDR1_PAGESIZE, reg) ? SZ_64K : SZ_4K;
@@ -765,6 +779,7 @@ static u64 KGSL_IOMMU_GET_CTX_REG_Q(struct kgsl_iommu_context *ctx, u32 offset)
 {
 	void __iomem *addr = kgsl_iommu_reg(ctx, offset);
 
+	JTRACE("smmu cb%d readq 0x%x from %ps", ctx->cb_num, offset, __builtin_return_address(0));
 	return readq_relaxed(addr);
 }
 
@@ -773,6 +788,8 @@ static void KGSL_IOMMU_SET_CTX_REG(struct kgsl_iommu_context *ctx, u32 offset,
 {
 	void __iomem *addr = kgsl_iommu_reg(ctx, offset);
 
+	JTRACE("smmu cb%d write 0x%x = 0x%x from %ps", ctx->cb_num, offset, val,
+	       __builtin_return_address(0));
 	writel_relaxed(val, addr);
 }
 
@@ -780,6 +797,7 @@ static u32 KGSL_IOMMU_GET_CTX_REG(struct kgsl_iommu_context *ctx, u32 offset)
 {
 	void __iomem *addr = kgsl_iommu_reg(ctx, offset);
 
+	JTRACE("smmu cb%d read 0x%x from %ps", ctx->cb_num, offset, __builtin_return_address(0));
 	return readl_relaxed(addr);
 }
 
@@ -859,6 +877,7 @@ static int kgsl_iommu_reserve_global_gpuaddr(struct kgsl_mmu *mmu,
 static void kgsl_iommu_map_global(struct kgsl_mmu *mmu,
 		struct kgsl_memdesc *memdesc, u32 padding)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	if (!memdesc->gpuaddr) {
 		if (kgsl_iommu_reserve_global_gpuaddr(mmu, memdesc, padding))
 			return;
@@ -1310,6 +1329,8 @@ static void kgsl_iommu_disable_clk(struct kgsl_mmu *mmu)
 	struct kgsl_iommu *iommu = &mmu->iommu;
 	struct device *iommu_dev;
 
+	JTRACE("smmu disable_clk from %ps", __builtin_return_address(0));
+
 	atomic_dec(&iommu->clk_enable_count);
 
 	/*
@@ -1336,6 +1357,8 @@ static void kgsl_iommu_enable_clk(struct kgsl_mmu *mmu)
 {
 	struct kgsl_iommu *iommu = &mmu->iommu;
 	struct device *iommu_dev;
+
+	JTRACE("smmu enable_clk from %ps", __builtin_return_address(0));
 
 	if (!IS_ERR_OR_NULL(iommu->cx_regulator))
 		WARN_ON(regulator_enable(iommu->cx_regulator));
@@ -1879,12 +1902,13 @@ static bool kgsl_iommu_ctx_terminated_on_fault(struct kgsl_mmu *mmu)
 
 static int kgsl_iommu_start(struct kgsl_mmu *mmu)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_iommu *iommu = &mmu->iommu;
 
 	kgsl_iommu_enable_clk(mmu);
 
 	/* Set the following registers only when the MMU type is QSMMU */
-	if (mmu->subtype != KGSL_IOMMU_SMMU_V500) {
+	if (mmu->subtype != KGSL_IOMMU_SMMU_V500 && !iommu->global_regs_secured) {
 		/* Enable hazard check from GPU_SMMU_HUM_CFG */
 		writel_relaxed(0x02, iommu->regbase + 0x6800);
 
@@ -1893,6 +1917,25 @@ static int kgsl_iommu_start(struct kgsl_mmu *mmu)
 
 		/* make sure register write committed */
 		wmb();
+	}
+
+	if (iommu->global_regs_secured && iommu->ctx_regs_programmed) {
+		kgsl_iommu_disable_clk(mmu);
+		return 0;
+	}
+	iommu->ctx_regs_programmed = true;
+
+	/* Standard MSM8998 domains are configured by arm-smmu, and do not
+	 * support split TTBR0/TTBR1 pagetables. In particular its AArch64 TCR
+	 * has EPD1 set (observed 0x802010). The legacy enable_ptwalk() clears
+	 * both EPD bits, enabling a TTBR1 table which does not exist here.
+	 * Preserve the native domain's TCR and fault-policy setup, just as
+	 * drm/msm does, rather than programming downstream context registers.
+	 */
+	if (iommu->global_regs_secured &&
+	    !test_bit(KGSL_MMU_IOPGTABLE, &mmu->features)) {
+		kgsl_iommu_disable_clk(mmu);
+		return 0;
 	}
 
 	kgsl_iommu_configure_gpu_sctlr(mmu, mmu->pfpolicy, &iommu->user_context);
@@ -2926,7 +2969,7 @@ int kgsl_iommu_probe_standard(struct kgsl_device *device, struct platform_device
 	struct kgsl_mmu *mmu = &device->mmu;
 	struct kgsl_iommu_pt *pt;
 	struct of_phandle_args args;
-	u32 val[4];
+	struct resource res;
 	int ret;
 
 	node = pdev->dev.of_node;
@@ -2972,7 +3015,8 @@ int kgsl_iommu_probe_standard(struct kgsl_device *device, struct platform_device
 	pm_runtime_enable(virt_dev);
 
 	/* Map IOMMU register range from smmu node to virtual memory */
-	ret = of_property_read_u32_array(smmu_node, "reg", val, 4);
+	/* Honour the parent's #address-cells/#size-cells (one cell on msm8998) */
+	ret = of_address_to_resource(smmu_node, 0, &res);
 	if (ret) {
 		dev_err(&device->pdev->dev,
 			"%pOF: Unable to read KGSL IOMMU register range\n",
@@ -2980,7 +3024,7 @@ int kgsl_iommu_probe_standard(struct kgsl_device *device, struct platform_device
 		goto err;
 	}
 
-	iommu->regbase = devm_ioremap(&device->pdev->dev, val[1], val[3]);
+	iommu->regbase = devm_ioremap(&device->pdev->dev, res.start, resource_size(&res));
 	if (!iommu->regbase) {
 		dev_err(&device->pdev->dev, "Couldn't map IOMMU registers\n");
 		ret = -ENOMEM;
@@ -3032,11 +3076,37 @@ int kgsl_iommu_probe_standard(struct kgsl_device *device, struct platform_device
 	if (of_device_is_compatible(smmu_node, "qcom,adreno-smmu"))
 		set_bit(KGSL_MMU_IOPGTABLE, &mmu->features);
 
+	/*
+	 * On MSM8998 any non-secure access to the GPU SMMU's global registers
+	 * after the zap shader runs resets the SoC (see arm-smmu-qcom.c).
+	 */
+	iommu->global_regs_secured =
+		of_device_is_compatible(smmu_node, "qcom,msm8998-smmu-v2");
+
 	/* Setup iommu default non secure context */
 	ret = kgsl_iommu_setup_context_standard(mmu, node, &iommu->user_context,
 		"gfx3d_user", kgsl_iommu_default_fault_handler);
 	if (ret)
 		goto err;
+
+	/*
+	 * Per-process pagetables keep the globals in a TTBR1 table. arm-smmu
+	 * refuses split pagetables on some SMMUs (msm8996/msm8998/sdm630), so
+	 * fall back to a single pagetable there, as drm/msm runs a5xx.
+	 */
+	if (test_bit(KGSL_MMU_IOPGTABLE, &mmu->features)) {
+		struct adreno_smmu_priv *adreno_smmu = &iommu->user_context.adreno_smmu;
+		const struct io_pgtable_cfg *cfg = NULL;
+
+		if (adreno_smmu->cookie)
+			cfg = adreno_smmu->get_ttbr1_cfg(adreno_smmu->cookie);
+
+		if (!cfg || !(cfg->quirks & IO_PGTABLE_QUIRK_ARM_TTBR1)) {
+			dev_info(&pdev->dev,
+				"SMMU has no split pagetables, using a single pagetable\n");
+			clear_bit(KGSL_MMU_IOPGTABLE, &mmu->features);
+		}
+	}
 
 	/* Make the default pagetable */
 	mmu->defaultpagetable = kgsl_iommu_default_pagetable(mmu);

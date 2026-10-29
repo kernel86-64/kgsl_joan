@@ -1127,7 +1127,7 @@ void a5xx_crashdump_init(struct adreno_device *adreno_dev)
 	/* Now allocate the script and data buffers */
 
 	/* The script buffers needs 2 extra qwords on the end */
-	if (!IS_ERR_OR_NULL(capturescript))
+	if (IS_ERR_OR_NULL(capturescript))
 		capturescript = kgsl_allocate_global(device,
 			script_size + 16, 0, KGSL_MEMFLAGS_GPUREADONLY,
 			KGSL_MEMDESC_PRIVILEGED, "capturescript");
@@ -1135,7 +1135,7 @@ void a5xx_crashdump_init(struct adreno_device *adreno_dev)
 	if (IS_ERR(capturescript))
 		return;
 
-	if (!IS_ERR_OR_NULL(registers))
+	if (IS_ERR_OR_NULL(registers))
 		registers = kgsl_allocate_global(device, data_size, 0, 0,
 			KGSL_MEMDESC_PRIVILEGED, "capturescript_regs");
 

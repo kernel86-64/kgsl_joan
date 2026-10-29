@@ -12,7 +12,7 @@
 /*****************************************************************************
  * power flags
  ****************************************************************************/
-#define KGSL_MAX_CLKS 19
+#define KGSL_MAX_CLKS 20
 
 #define KGSL_MAX_PWRLEVELS 32
 
@@ -127,6 +127,8 @@ struct kgsl_pwrctrl {
 	struct device *gmu_cx_pd;
 	/** @gx_pd: Power domain for controlling GX GDSC */
 	struct device *gx_pd;
+	/** @mx_pd: Power domain voting VDD_MX through the OPP required-opps */
+	struct device *mx_pd;
 	/** @gx_regulator_parent: Pointer to the GX domain parent supply */
 	struct regulator *gx_regulator_parent;
 	/** @gx_regulator_parent_min_corner: Minimum supply voltage for GX parent */

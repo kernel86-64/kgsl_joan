@@ -9,6 +9,7 @@
 #include <linux/firmware.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/moduleparam.h>
 #include <linux/version.h>
 #if IS_ENABLED(CONFIG_QCOM_SCM_ADDON)
 #include <linux/firmware/qcom/qcom_scm_addon.h>
@@ -16,6 +17,7 @@
 #include <linux/slab.h>
 
 #include "adreno.h"
+#include "kgsl_joan_trace.h"
 #include "adreno_a5xx.h"
 #include "adreno_a5xx_packets.h"
 #include "adreno_pm4types.h"
@@ -24,6 +26,11 @@
 #include "kgsl_util.h"
 
 static int critical_packet_constructed;
+/* Isolated bring-up comparison with drm/msm a5xx_hw_init(). Disabled by
+ * default until the normal open/submit/suspend sequence passes on joan. */
+static bool joan_sw_reset;
+module_param(joan_sw_reset, bool, 0600);
+MODULE_PARM_DESC(joan_sw_reset, "Reset mainline-DT A540 core before startup programming");
 static unsigned int crit_pkts_dwords;
 
 static void a5xx_irq_storm_worker(struct work_struct *work);
@@ -179,6 +186,7 @@ static int a5xx_critical_packet_construct(struct adreno_device *adreno_dev)
 }
 
 static int a5xx_microcode_read(struct adreno_device *adreno_dev);
+static int a5xx_zap_shader_start(struct adreno_device *adreno_dev);
 
 static int a5xx_init(struct adreno_device *adreno_dev)
 {
@@ -261,14 +269,15 @@ static void a5xx_protect_init(struct adreno_device *adreno_dev)
 	}
 
 	/*
-	 * For a530 and a540 the SMMU region is 0x20000 bytes long and 0x10000
-	 * bytes on all other targets. The base offset for both is 0x40000.
-	 * Write it to the next available slot
+	 * CP_PROTECT describes register-word offsets and power-of-two counts,
+	 * not byte offsets. The SMMU starts 0x40000 bytes from the GPU base,
+	 * and spans 0x20000 bytes on a530/a540 (0x10000 on other targets).
+	 * Encoding the byte values instead covers unrelated GPU registers.
 	 */
 	if (adreno_is_a530(adreno_dev) || adreno_is_a540(adreno_dev))
-		_setprotectreg(device, reg + 1, 0x40000, ilog2(0x20000));
+		_setprotectreg(device, reg + 1, 0x10000, ilog2(0x8000));
 	else
-		_setprotectreg(device, reg + 1, 0x40000, ilog2(0x10000));
+		_setprotectreg(device, reg + 1, 0x10000, ilog2(0x4000));
 }
 
 /*
@@ -342,6 +351,7 @@ static void a5xx_restore_isense_regs(struct adreno_device *adreno_dev)
  */
 static int a5xx_regulator_enable(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	unsigned int ret;
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 
@@ -406,6 +416,7 @@ static int a5xx_regulator_enable(struct adreno_device *adreno_dev)
  */
 static void a5xx_regulator_disable(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	unsigned int reg;
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 
@@ -676,6 +687,7 @@ static int _gpmu_send_init_cmds(struct adreno_device *adreno_dev)
  */
 static int a5xx_gpmu_start(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	int ret;
 	unsigned int reg, retry = GPMU_FW_INIT_RETRY;
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
@@ -1259,14 +1271,35 @@ static void _setup_throttling_counters(struct adreno_device *adreno_dev)
  */
 static int a5xx_start(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	const struct adreno_a5xx_core *a5xx_core = to_a5xx_core(adreno_dev);
 	unsigned int bit;
 	int ret;
 
+	if (joan_sw_reset && adreno_is_a540(adreno_dev) &&
+	    of_device_is_compatible(device->pdev->dev.of_node, "qcom,adreno")) {
+		u32 posted;
+
+		/* Match the working DRM driver: drain the asserted write before
+		 * deasserting, then program all core state from a known reset. */
+		kgsl_regwrite(device, A5XX_RBBM_SW_RESET_CMD, 1);
+		kgsl_regread(device, A5XX_RBBM_SW_RESET_CMD, &posted);
+		kgsl_regwrite(device, A5XX_RBBM_SW_RESET_CMD, 0);
+		JTRACE("A540 startup software reset complete (readback %#x)", posted);
+	}
+
 	ret = kgsl_mmu_start(device);
 	if (ret)
 		return ret;
+
+	/*
+	 * Start from a known state, as drm/msm does: the GPU may still hold
+	 * another driver's ring, preemption and shadow addresses.
+	 */
+	kgsl_regwrite(device, A5XX_RBBM_SW_RESET_CMD, 1);
+	kgsl_regread(device, A5XX_RBBM_SW_RESET_CMD, &bit);
+	kgsl_regwrite(device, A5XX_RBBM_SW_RESET_CMD, 0);
 
 	adreno_get_bus_counters(adreno_dev);
 	adreno_perfcounter_restore(adreno_dev);
@@ -1501,6 +1534,17 @@ static int a5xx_start(struct adreno_device *adreno_dev)
 		kgsl_regwrite(device, A5XX_RBBM_SECVID_TSB_TRUSTED_SIZE,
 			FIELD_PREP(GENMASK(31, 12),
 			(KGSL_IOMMU_SECURE_SIZE(&device->mmu) / SZ_4K)));
+	} else {
+		/*
+		 * No secure context: clear the trusted window the zap shader
+		 * may leave behind, as drm/msm does. Accesses inside it are
+		 * tagged secure and an XPU resets the SoC on them.
+		 */
+		JTRACE("secvid tsb: clearing trusted window");
+		kgsl_regwrite(device, A5XX_RBBM_SECVID_TSB_CNTL, 0x0);
+		kgsl_regwrite(device, A5XX_RBBM_SECVID_TSB_TRUSTED_BASE_LO, 0x0);
+		kgsl_regwrite(device, A5XX_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0x0);
+		kgsl_regwrite(device, A5XX_RBBM_SECVID_TSB_TRUSTED_SIZE, 0x0);
 	}
 
 	a5xx_preemption_start(adreno_dev);
@@ -1556,6 +1600,7 @@ static int _preemption_init(
 
 static int a5xx_post_start(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	int ret;
 	unsigned int *cmds, *start;
 	struct adreno_ringbuffer *rb = adreno_dev->cur_rb;
@@ -1604,7 +1649,15 @@ static int a5xx_post_start(struct adreno_device *adreno_dev)
 
 static int a5xx_gpmu_init(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	int ret;
+
+	/* The bring-up override must also skip the setup which depends on a
+	 * running GPMU. Leaving its mailbox and collapse controls programmed
+	 * made joan_gpmu=0 an incomplete exclusion test. Default behavior is
+	 * unchanged: a5xx_has_gpmu() is true on A530/A540 unless overridden. */
+	if (!a5xx_has_gpmu(adreno_dev))
+		return 0;
 
 	/* Set up LM before initializing the GPMU */
 	a5xx_lm_init(adreno_dev);
@@ -1623,6 +1676,7 @@ static int a5xx_gpmu_init(struct adreno_device *adreno_dev)
 
 static int a5xx_zap_shader_resume(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	int ret = kgsl_pas_set_remote_state(0, 13);
 
 	if (ret)
@@ -1638,10 +1692,10 @@ static int a5xx_zap_shader_resume(struct kgsl_device *device)
  */
 static int a5xx_microcode_load(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct adreno_firmware *pm4_fw = ADRENO_FW(adreno_dev, ADRENO_FW_PM4);
 	struct adreno_firmware *pfp_fw = ADRENO_FW(adreno_dev, ADRENO_FW_PFP);
-	const struct adreno_a5xx_core *a5xx_core = to_a5xx_core(adreno_dev);
 	uint64_t gpuaddr;
 
 	gpuaddr = pm4_fw->memdesc->gpuaddr;
@@ -1658,10 +1712,39 @@ static int a5xx_microcode_load(struct adreno_device *adreno_dev)
 
 	/*
 	 * Do not invoke to load zap shader if MMU does
-	 * not support secure mode.
+	 * not support secure mode. Standard DT bindings carry no secure
+	 * context bank, but production TZ still guards RBBM_SECVID_TRUST_CNTL:
+	 * a direct write from HLOS hangs the bus. Like drm/msm, always use
+	 * the zap shader when DT provides one.
 	 */
-	if (!device->mmu.secured)
+	return 0;
+}
+
+/*
+ * Load (or resume) the zap shader, before the CP starts. Running it after ME
+ * init, as drm/msm orders it, resets the SoC during open on the joan port.
+ */
+static int a5xx_zap_shader_start(struct adreno_device *adreno_dev)
+{
+	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+	const struct adreno_a5xx_core *a5xx_core = to_a5xx_core(adreno_dev);
+	struct device_node *zap_node;
+
+	zap_node = of_get_available_child_by_name(device->pdev->dev.of_node, "zap-shader");
+	of_node_put(zap_node);
+	if (!device->mmu.secured && !zap_node)
 		return 0;
+
+	/*
+	 * joan bring-up: drm/msm has already loaded and authenticated the zap
+	 * shader this boot and never shuts it down, so TZ still owns its
+	 * memory region. joan_zapresume=1 resumes that image instead of
+	 * rewriting the region.
+	 */
+	if (kgsl_joan_zapresume && !adreno_dev->zap_loaded) {
+		adreno_dev->zap_loaded = true;
+		return a5xx_zap_shader_resume(device);
+	}
 
 	if (adreno_dev->zap_loaded && !(ADRENO_FEATURE(adreno_dev,
 		ADRENO_CPZ_RETENTION)))
@@ -1754,6 +1837,7 @@ static int a5xx_critical_packet_submit(struct adreno_device *adreno_dev,
 static int a5xx_send_me_init(struct adreno_device *adreno_dev,
 			 struct adreno_ringbuffer *rb)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	unsigned int *cmds;
 	int i = 0, ret;
 
@@ -1789,6 +1873,13 @@ static int a5xx_send_me_init(struct adreno_device *adreno_dev,
 	if (CP_INIT_MASK & CP_INIT_UCODE_WORKAROUND_MASK)
 		cmds[i++] = _me_init_ucode_workarounds(adreno_dev);
 
+	/*
+	 * The packet declares 8 ordinals. Zero the ones the mask leaves out
+	 * instead of handing the CP whatever the ring held (0xaa fill).
+	 */
+	while (i < 9)
+		cmds[i++] = 0;
+
 	ret = a5xx_ringbuffer_submit(rb, NULL, true);
 	if (!ret) {
 		ret = adreno_spin_idle(adreno_dev, 2000);
@@ -1806,6 +1897,7 @@ static int a5xx_send_me_init(struct adreno_device *adreno_dev,
  */
 static int a5xx_rb_start(struct adreno_device *adreno_dev)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct adreno_ringbuffer *rb;
 	uint64_t addr;
@@ -1846,6 +1938,10 @@ static int a5xx_rb_start(struct adreno_device *adreno_dev)
 		upper_32_bits(rb->buffer_desc->gpuaddr));
 
 	ret = a5xx_microcode_load(adreno_dev);
+	if (ret)
+		return ret;
+
+	ret = a5xx_zap_shader_start(adreno_dev);
 	if (ret)
 		return ret;
 
@@ -2283,6 +2379,7 @@ static irqreturn_t a5xx_irq_handler(struct adreno_device *adreno_dev)
 	u32 status;
 
 	kgsl_regread(device, A5XX_RBBM_INT_0_STATUS, &status);
+	JTRACE("irq INT_0_STATUS=0x%08x", status);
 
 	/*
 	 * Clear all the interrupt bits except A5XX_INT_RBBM_AHB_ERROR.
@@ -2290,17 +2387,18 @@ static irqreturn_t a5xx_irq_handler(struct adreno_device *adreno_dev)
 	 * so don't touch it yet to avoid a storm
 	 */
 	kgsl_regwrite(device, A5XX_RBBM_INT_CLEAR_CMD,
-		status & ~A5XX_INT_RBBM_AHB_ERROR);
+		status & ~BIT(A5XX_INT_RBBM_AHB_ERROR));
 
 	/* Call the helper function for callbacks */
 	ret = adreno_irq_callbacks(adreno_dev, a5xx_irq_funcs, status);
+	JTRACE("irq callbacks done");
 
 	trace_kgsl_a5xx_irq_status(adreno_dev, status);
 
 	/* Now chear AHB_ERROR if it was set */
-	if (status & A5XX_INT_RBBM_AHB_ERROR)
+	if (status & BIT(A5XX_INT_RBBM_AHB_ERROR))
 		kgsl_regwrite(device, A5XX_RBBM_INT_CLEAR_CMD,
-			A5XX_INT_RBBM_AHB_ERROR);
+			BIT(A5XX_INT_RBBM_AHB_ERROR));
 
 	return ret;
 }
@@ -2318,11 +2416,14 @@ static bool a5xx_hw_isidle(struct adreno_device *adreno_dev)
 		udelay(5);
 
 	kgsl_regread(device, A5XX_RBBM_STATUS, &status);
+	JTRACE("isidle RBBM_STATUS=0x%08x", status);
 
 	if (status & 0xfffffffe)
 		return false;
 
 	kgsl_regread(device, A5XX_RBBM_INT_0_STATUS, &status);
+	JTRACE("isidle INT_0_STATUS=0x%08x mask=0x%08x pending=%d", status,
+	       adreno_dev->irq_mask, atomic_read(&adreno_dev->pending_irq_refcnt));
 
 	/* Return busy if a interrupt is pending */
 	return !((status & adreno_dev->irq_mask) ||
@@ -2335,9 +2436,12 @@ static int a5xx_clear_pending_transactions(struct adreno_device *adreno_dev)
 	u32 mask = A5XX_VBIF_XIN_HALT_CTRL0_MASK;
 	int ret;
 
+	JTRACE("vbif halt request");
 	kgsl_regwrite(device, A5XX_VBIF_XIN_HALT_CTRL0, mask);
 	ret = adreno_wait_for_halt_ack(device, A5XX_VBIF_XIN_HALT_CTRL1, mask);
+	JTRACE("vbif halt ack %d", ret);
 	kgsl_regwrite(device, A5XX_VBIF_XIN_HALT_CTRL0, 0);
+	JTRACE("vbif halt released");
 
 	return ret;
 }
@@ -2353,7 +2457,9 @@ static bool a5xx_is_hw_collapsible(struct adreno_device *adreno_dev)
 	/* If feature is not supported or enabled, no worry */
 	if (!adreno_dev->sptp_pc_enabled)
 		return true;
+	JTRACE("read GPMU_SP_PWR_CLK_STATUS");
 	kgsl_regread(device, A5XX_GPMU_SP_PWR_CLK_STATUS, &reg);
+	JTRACE("GPMU_SP_PWR_CLK_STATUS=0x%08x", reg);
 	if (reg & BIT(20))
 		return false;
 	kgsl_regread(device, A5XX_GPMU_RBCCU_PWR_CLK_STATUS, &reg);

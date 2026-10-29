@@ -5,6 +5,8 @@
  */
 
 #include "adreno.h"
+
+extern int kgsl_joan_ringdump;
 #include "adreno_a5xx.h"
 #include "adreno_pm4types.h"
 #include "adreno_ringbuffer.h"
@@ -82,6 +84,14 @@ int a5xx_ringbuffer_submit(struct adreno_ringbuffer *rb,
 				rptr));
 	}
 
+	if (kgsl_joan_ringdump) {
+		u32 *ring = rb->buffer_desc->hostptr;
+		u32 i;
+
+		for (i = rb->wptr; i != rb->_wptr && i < KGSL_RB_DWORDS; i++)
+			pr_info("joan-ring: rb%d %04x %08x\n", rb->id, i, ring[i]);
+	}
+
 	spin_lock_irqsave(&rb->preempt_lock, flags);
 	if (adreno_in_preempt_state(adreno_dev, ADRENO_PREEMPT_NONE)) {
 		if (adreno_dev->cur_rb == rb)
@@ -99,10 +109,15 @@ int a5xx_ringbuffer_init(struct adreno_device *adreno_dev)
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	int i;
 
+	/*
+	 * The CP writes the RB read pointer here through the RPTR writeback,
+	 * which is not a privileged transaction on a5xx (no APRIV, unlike
+	 * a6xx+). A privileged mapping faults it, as drm/msm's check_apriv()
+	 * also implies.
+	 */
 	if (IS_ERR_OR_NULL(device->scratch))
 		device->scratch = kgsl_allocate_global(device, PAGE_SIZE,
-			0, 0, KGSL_MEMDESC_RANDOM | KGSL_MEMDESC_PRIVILEGED,
-			"scratch");
+			0, 0, KGSL_MEMDESC_RANDOM, "scratch");
 
 	if (IS_ERR(device->scratch))
 		return PTR_ERR(device->scratch);

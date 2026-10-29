@@ -21,6 +21,7 @@
 #include <soc/qcom/dcvs.h>
 
 #include "kgsl_bus.h"
+#include "kgsl_joan_trace.h"
 #include "kgsl_eventlog.h"
 #include "kgsl_device.h"
 #include "kgsl_gmu_core.h"
@@ -57,6 +58,8 @@ static const char * const clocks[KGSL_MAX_CLKS] = {
 	"smmu_vote",
 	"apb_pclk",
 	"hub_cx_int_clk",
+	/* msm8998: source of the GFX BIMC path that mem/mem_iface branch off */
+	"mem_src_clk",
 };
 
 static void kgsl_pwrctrl_clk(struct kgsl_device *device, bool state,
@@ -1252,6 +1255,7 @@ void kgsl_pwrctrl_busy_time(struct kgsl_device *device, u64 time, u64 busy, u64 
 static void kgsl_pwrctrl_clk(struct kgsl_device *device, bool state,
 					  int requested_state)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	int i = 0;
 
@@ -1338,6 +1342,7 @@ static void kgsl_pwrctrl_clk(struct kgsl_device *device, bool state,
 
 int kgsl_pwrctrl_axi(struct kgsl_device *device, bool state)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 
 	if (test_bit(KGSL_PWRFLAGS_AXI_ON, &pwr->ctrl_flags))
@@ -1402,6 +1407,7 @@ int kgsl_regulator_disable_wait(struct regulator *reg, u32 timeout)
 
 int kgsl_pwrctrl_enable_cx_gdsc(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	int ret;
 
@@ -1439,25 +1445,39 @@ int kgsl_pwrctrl_enable_cx_gdsc(struct kgsl_device *device)
 
 int kgsl_pwrctrl_enable_gx_gdsc(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	int ret;
 
 	if (!pwr->gx_regulator && !pwr->gx_pd)
 		return 0;
 
+	/* MX goes up first and comes down last, as drm/msm does it */
+	if (pwr->mx_pd) {
+		ret = pm_runtime_resume_and_get(pwr->mx_pd);
+		if (ret) {
+			dev_err(device->dev, "Failed to enable MX, error %d\n", ret);
+			return ret;
+		}
+	}
+
 	if (pwr->gx_regulator)
 		ret = regulator_enable(pwr->gx_regulator);
 	else
 		ret = pm_runtime_resume_and_get(pwr->gx_pd);
 
-	if (ret)
+	if (ret) {
 		dev_err(device->dev, "Failed to enable GX gdsc, error %d\n", ret);
+		if (pwr->mx_pd)
+			pm_runtime_put_sync(pwr->mx_pd);
+	}
 
 	return ret;
 }
 
 void kgsl_pwrctrl_disable_cx_gdsc(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 
 	if (!pwr->cx_regulator && !pwr->gmu_cx_pd)
@@ -1475,6 +1495,7 @@ void kgsl_pwrctrl_disable_cx_gdsc(struct kgsl_device *device)
 
 void kgsl_pwrctrl_disable_gx_gdsc(struct kgsl_device *device)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	int ret;
 
@@ -1488,6 +1509,9 @@ void kgsl_pwrctrl_disable_gx_gdsc(struct kgsl_device *device)
 
 	if (ret)
 		dev_err(device->dev, "vdd is stuck on, error %d\n", ret);
+
+	if (pwr->mx_pd)
+		pm_runtime_put_sync(pwr->mx_pd);
 }
 
 static int enable_gdscs(struct kgsl_device *device)
@@ -1713,6 +1737,7 @@ static int kgsl_register_gdsc_notifier(struct kgsl_device *device)
 
 static int kgsl_pwrctrl_pwrrail(struct kgsl_device *device, bool state)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	int status = 0;
 
@@ -1753,6 +1778,7 @@ static int kgsl_pwrctrl_pwrrail(struct kgsl_device *device, bool state)
 
 void kgsl_pwrctrl_irq(struct kgsl_device *device, bool state)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 
 	if (!(device->freq_limiter_intr_num || pwr->interrupt_num))
@@ -2565,14 +2591,20 @@ _slumber(struct kgsl_device *device)
 			kgsl_pwrctrl_request_state(device, KGSL_STATE_NONE);
 			return -EBUSY;
 		}
+		JTRACE("slumber: collapsible");
 		kgsl_delete_timer_sync(&device->idle_timer);
 		kgsl_pwrctrl_irq(device, false);
 		/* make sure power is on to stop the device*/
 		status = kgsl_pwrctrl_enable(device);
+		JTRACE("slumber: check_idle");
 		device->ftbl->check_idle(device);
+		JTRACE("slumber: stop");
 		device->ftbl->stop(device);
+		JTRACE("slumber: disable");
 		kgsl_pwrctrl_disable(device);
+		JTRACE("slumber: pwrscale_sleep");
 		kgsl_pwrscale_sleep(device);
+		JTRACE("slumber: done");
 		KGSL_TRACE_GPU_FREQ(0, 0, 0);
 		kgsl_pwrctrl_set_state(device, KGSL_STATE_SLUMBER);
 		break;
@@ -2645,6 +2677,7 @@ err:
  */
 int kgsl_pwrctrl_change_state(struct kgsl_device *device, int state)
 {
+	JTRACE("enter %s from %ps", __func__, __builtin_return_address(0));
 	int status = 0;
 
 	if (device->state == state)

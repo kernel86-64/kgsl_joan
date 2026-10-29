@@ -1357,6 +1357,21 @@ static int add_syncpoints_compat(struct kgsl_device *device,
  *   0: All data fields are empty (nothing to do)
  *   1: All list information is valid
  */
+/*
+ * Copy one element of a user list the way downstream KGSL did: take at most
+ * the kernel's struct size and zero the rest. Older Adreno blobs (msm8998,
+ * 2020) pass the size of the whole list as the element size for multi-IB
+ * submits; copy_struct_from_user() then sees the next element as non-zero
+ * trailing bytes and fails the submit, which leaves the blob waiting forever
+ * on a timestamp it thinks it queued.
+ */
+static int _copy_list_entry(void *dst, size_t ksize, const void __user *src,
+		size_t usize)
+{
+	memset(dst, 0, ksize);
+	return copy_from_user(dst, src, min(ksize, usize)) ? -EFAULT : 0;
+}
+
 static int _verify_input_list(unsigned int count, void __user *ptr,
 		unsigned int size)
 {
@@ -1482,7 +1497,7 @@ int kgsl_drawobj_cmd_add_cmdlist(struct kgsl_device *device,
 		return ret;
 
 	for (i = 0; i < count; i++) {
-		if (copy_struct_from_user(&obj, sizeof(obj), ptr, size))
+		if (_copy_list_entry(&obj, sizeof(obj), ptr, size))
 			return -EFAULT;
 
 		/* Sanity check the flags */
@@ -1521,7 +1536,7 @@ int kgsl_drawobj_cmd_add_memlist(struct kgsl_device *device,
 		return ret;
 
 	for (i = 0; i < count; i++) {
-		if (copy_struct_from_user(&obj, sizeof(obj), ptr, size))
+		if (_copy_list_entry(&obj, sizeof(obj), ptr, size))
 			return -EFAULT;
 
 		if (!(obj.flags & KGSL_OBJLIST_MEMOBJ)) {
@@ -1599,7 +1614,7 @@ int kgsl_drawobj_sync_add_synclist(struct kgsl_device *device,
 		return -ENOMEM;
 
 	for (i = 0; i < count; i++) {
-		if (copy_struct_from_user(&syncpoint, sizeof(syncpoint), ptr, size))
+		if (_copy_list_entry(&syncpoint, sizeof(syncpoint), ptr, size))
 			return -EFAULT;
 
 		sync.type = syncpoint.type;

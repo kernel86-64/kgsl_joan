@@ -181,6 +181,17 @@ struct kgsl_iommu {
 	/** @lpac_context: Container for the LPAC iommu context */
 	struct kgsl_iommu_context lpac_context;
 	void __iomem *regbase;
+	/**
+	 * @global_regs_secured: Firmware XPU-protects the SMMU's global
+	 * register space once the GPU is up, so leave it alone
+	 */
+	bool global_regs_secured;
+	/**
+	 * @ctx_regs_programmed: Context bank set up once; with
+	 * @global_regs_secured the SMMU stays powered and keeps it, and it must
+	 * not be touched again once the GPU is up
+	 */
+	bool ctx_regs_programmed;
 	struct kgsl_memdesc *setstate;
 	atomic_t clk_enable_count;
 	struct clk_bulk_data *clks;

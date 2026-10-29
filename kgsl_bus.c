@@ -190,6 +190,71 @@ u32 *kgsl_bus_get_table(struct platform_device *pdev,
 	return levels;
 }
 
+/*
+ * Standard msm8998 device trees carry no GPU bandwidth votes. Use the vendor
+ * values instead: the DDR table from msm8998-gpu.dtsi and the per-frequency
+ * levels for A540v2 from msm8998-v2.dtsi.
+ */
+static const u32 msm8998_ddr_table[] = {
+	0, 800000, 1200000, 1600000, 2400000, 3296000, 4376000,
+	5448000, 6144000, 8136000, 10368000, 12440000, 14432000,
+};
+
+static const struct {
+	u32 mhz, bus, min, max;
+} msm8998_bus_levels[] = {
+	{ 710, 12, 12, 12 },
+	{ 670, 12, 11, 12 },
+	{ 596, 11, 9, 12 },
+	{ 515, 11, 9, 12 },
+	{ 414, 9, 8, 11 },
+	{ 342, 8, 5, 9 },
+	{ 257, 5, 3, 8 },
+};
+
+int kgsl_bus_get_fallback_level(unsigned long freq, u32 *bus, u32 *min, u32 *max)
+{
+	int i;
+
+	if (!of_machine_is_compatible("qcom,msm8998"))
+		return -ENODEV;
+
+	for (i = 0; i < ARRAY_SIZE(msm8998_bus_levels); i++) {
+		if (msm8998_bus_levels[i].mhz == freq / 1000000) {
+			*bus = msm8998_bus_levels[i].bus;
+			*min = msm8998_bus_levels[i].min;
+			*max = msm8998_bus_levels[i].max;
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+
+/* joan bring-up: joan_bus=0 votes drm/msm's minimal GPU bandwidth instead */
+int kgsl_joan_bus = 1;
+module_param_named(joan_bus, kgsl_joan_bus, int, 0644);
+
+static u32 *kgsl_bus_get_fallback_table(int *count)
+{
+	u32 *table;
+	int i;
+
+	if (!of_machine_is_compatible("qcom,msm8998"))
+		return ERR_PTR(-ENODEV);
+
+	*count = ARRAY_SIZE(msm8998_ddr_table);
+	table = kmemdup(msm8998_ddr_table, sizeof(msm8998_ddr_table), GFP_KERNEL);
+	if (!table)
+		return ERR_PTR(-ENOMEM);
+
+	if (!kgsl_joan_bus)
+		for (i = 1; i < *count; i++)
+			table[i] = 5680;	/* kBps, drm/msm's gfx-mem vote */
+
+	return table;
+}
+
 int kgsl_bus_init(struct kgsl_device *device, struct platform_device *pdev)
 {
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
@@ -217,6 +282,9 @@ int kgsl_bus_init(struct kgsl_device *device, struct platform_device *pdev)
 	 * values from OPP table.
 	 */
 	pwr->ddr_table = kgsl_bus_get_table_from_opp_freqs(pdev, &count);
+
+	if (IS_ERR(pwr->ddr_table))
+		pwr->ddr_table = kgsl_bus_get_fallback_table(&count);
 
 	if (IS_ERR(pwr->ddr_table)) {
 		int ret = PTR_ERR(pwr->ddr_table);

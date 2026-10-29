@@ -5329,8 +5329,15 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 		return status;
 
 	/* Probe standard kgsl smmu dt bindings */
-	if (of_device_is_compatible(pdev->dev.of_node, "qcom,adreno"))
-		kgsl_iommu_probe_standard(device, pdev);
+	if (of_device_is_compatible(pdev->dev.of_node, "qcom,adreno")) {
+		/* Running without the SMMU would hand the GPU physical addresses */
+		status = kgsl_iommu_probe_standard(device, pdev);
+		if (status) {
+			dev_err(device->dev, "IOMMU probe failed: %d\n", status);
+			_unregister_device(device);
+			return status;
+		}
+	}
 
 	/* Can return -EPROBE_DEFER */
 	status = kgsl_pwrctrl_init(device);

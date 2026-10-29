@@ -175,6 +175,10 @@ void a5xx_preemption_trigger(struct adreno_device *adreno_dev)
 	unsigned int contextidr;
 	unsigned long flags;
 
+	/* The CP completion IRQ also calls here on single-ring devices. */
+	if (!adreno_is_preemption_enabled(adreno_dev))
+		return;
+
 	/* Put ourselves into a possible trigger state */
 	if (!adreno_move_preempt_state(adreno_dev,
 		ADRENO_PREEMPT_NONE, ADRENO_PREEMPT_START))
@@ -322,11 +326,13 @@ u32 a5xx_preemption_pre_ibsubmit(struct adreno_device *adreno_dev,
 			struct adreno_context *drawctxt, u32 *cmds)
 {
 	unsigned int *cmds_orig = cmds;
-	uint64_t gpuaddr = rb->preemption_desc->gpuaddr;
+	uint64_t gpuaddr;
 	unsigned int preempt_style = 0;
 
 	if (!adreno_is_preemption_enabled(adreno_dev))
 		return 0;
+
+	gpuaddr = rb->preemption_desc->gpuaddr;
 
 	if (drawctxt) {
 		/*
