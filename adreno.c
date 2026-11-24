@@ -1393,6 +1393,17 @@ static int adreno_of_parse_pwrlevels(struct adreno_device *adreno_dev)
 		if (IS_ERR(opp))
 			break;
 
+		/*
+		 * Mainline msm8998 DT carries a 27 MHz slumber OPP with zero
+		 * DDR bandwidth and no MX vote (for drm/msm suspend parking).
+		 * Never expose it as an active/default KGSL power level.
+		 */
+		if (ADRENO_GPUREV(adreno_dev) == ADRENO_REV_A540 &&
+		    freq < 100000000UL) {
+			dev_pm_opp_put(opp);
+			break;
+		}
+
 		level->gpu_freq = (u32)freq;
 		adreno_parse_opp_node(device, opp, level);
 

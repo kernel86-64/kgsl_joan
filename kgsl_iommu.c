@@ -777,8 +777,12 @@ static void __iomem *kgsl_iommu_reg(struct kgsl_iommu_context *ctx,
 
 static u64 KGSL_IOMMU_GET_CTX_REG_Q(struct kgsl_iommu_context *ctx, u32 offset)
 {
-	void __iomem *addr = kgsl_iommu_reg(ctx, offset);
+	void __iomem *addr;
 
+	if (KGSL_IOMMU(ctx->kgsldev)->global_regs_secured)
+		return 0;
+
+	addr = kgsl_iommu_reg(ctx, offset);
 	JTRACE("smmu cb%d readq 0x%x from %ps", ctx->cb_num, offset, __builtin_return_address(0));
 	return readq_relaxed(addr);
 }
@@ -786,8 +790,12 @@ static u64 KGSL_IOMMU_GET_CTX_REG_Q(struct kgsl_iommu_context *ctx, u32 offset)
 static void KGSL_IOMMU_SET_CTX_REG(struct kgsl_iommu_context *ctx, u32 offset,
 		u32 val)
 {
-	void __iomem *addr = kgsl_iommu_reg(ctx, offset);
+	void __iomem *addr;
 
+	if (KGSL_IOMMU(ctx->kgsldev)->global_regs_secured)
+		return;
+
+	addr = kgsl_iommu_reg(ctx, offset);
 	JTRACE("smmu cb%d write 0x%x = 0x%x from %ps", ctx->cb_num, offset, val,
 	       __builtin_return_address(0));
 	writel_relaxed(val, addr);
@@ -795,8 +803,12 @@ static void KGSL_IOMMU_SET_CTX_REG(struct kgsl_iommu_context *ctx, u32 offset,
 
 static u32 KGSL_IOMMU_GET_CTX_REG(struct kgsl_iommu_context *ctx, u32 offset)
 {
-	void __iomem *addr = kgsl_iommu_reg(ctx, offset);
+	void __iomem *addr;
 
+	if (KGSL_IOMMU(ctx->kgsldev)->global_regs_secured)
+		return 0;
+
+	addr = kgsl_iommu_reg(ctx, offset);
 	JTRACE("smmu cb%d read 0x%x from %ps", ctx->cb_num, offset, __builtin_return_address(0));
 	return readl_relaxed(addr);
 }

@@ -1297,6 +1297,7 @@ static int a5xx_start(struct adreno_device *adreno_dev)
 	 * Start from a known state, as drm/msm does: the GPU may still hold
 	 * another driver's ring, preemption and shadow addresses.
 	 */
+	clear_bit(ADRENO_DEVICE_GPMU_INITIALIZED, &adreno_dev->priv);
 	kgsl_regwrite(device, A5XX_RBBM_SW_RESET_CMD, 1);
 	kgsl_regread(device, A5XX_RBBM_SW_RESET_CMD, &bit);
 	kgsl_regwrite(device, A5XX_RBBM_SW_RESET_CMD, 0);
