@@ -890,8 +890,28 @@ static int kgsl_get_fence_value_str(struct dma_fence *fence, char *buf, size_t s
 
 void kgsl_get_fence_name(struct dma_fence *f, char *name, u32 max_size)
 {
-	int len = scnprintf(name, max_size, "%s %s", f->ops->get_driver_name(f),
-			f->ops->get_timeline_name(f));
+	int len;
+
+#if (KERNEL_VERSION(7, 0, 0) <= LINUX_VERSION_CODE)
+	const char __rcu *driver;
+	const char __rcu *timeline;
+
+	rcu_read_lock();
+	driver = dma_fence_driver_name(f);
+	timeline = dma_fence_timeline_name(f);
+	len = scnprintf(name, max_size, "%s %s",
+			rcu_dereference(driver),
+			rcu_dereference(timeline));
+	rcu_read_unlock();
+#else
+	const struct dma_fence_ops *ops = READ_ONCE(f->ops);
+
+	len = scnprintf(name, max_size, "%s %s",
+			(ops && ops->get_driver_name) ?
+				ops->get_driver_name(f) : "detached-driver",
+			(ops && ops->get_timeline_name) ?
+				ops->get_timeline_name(f) : "signaled-timeline");
+#endif
 
 	len += kgsl_get_fence_value_str(f, name + len, max_size - len);
 
@@ -924,8 +944,6 @@ void kgsl_get_fence_info(struct kgsl_drawobj_sync_event *event)
 	if (info_ptr->fences == NULL)
 		goto count;
 
-	info_ptr->num_fences = num_fences;
-
 	for (i = 0; i < num_fences; i++) {
 		struct dma_fence *f = fences[i];
 		struct fence_info *fi = &info_ptr->fences[i];
@@ -934,6 +952,8 @@ void kgsl_get_fence_info(struct kgsl_drawobj_sync_event *event)
 
 		kgsl_count_hw_fences(event, f);
 	}
+
+	smp_store_release(&info_ptr->num_fences, num_fences);
 
 	return;
 count:

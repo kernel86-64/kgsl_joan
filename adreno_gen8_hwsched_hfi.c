@@ -3246,9 +3246,24 @@ static int _submit_hw_fence(struct adreno_device *adreno_dev,
 			obj->ctxt_id = fence->context;
 			obj->seq_no =  fence->seqno;
 		}
-		trace_adreno_input_hw_fence(drawobj->context->id, obj->ctxt_id,
-			obj->seq_no, obj->flags, fence->ops->get_timeline_name ?
-			fence->ops->get_timeline_name(fence) : "unknown");
+#if (KERNEL_VERSION(7, 0, 0) <= LINUX_VERSION_CODE)
+		rcu_read_lock();
+		{
+			const char __rcu *timeline = dma_fence_timeline_name(fence);
+
+			trace_adreno_input_hw_fence(drawobj->context->id, obj->ctxt_id,
+				obj->seq_no, obj->flags, rcu_dereference(timeline));
+		}
+		rcu_read_unlock();
+#else
+		{
+			const struct dma_fence_ops *ops = READ_ONCE(fence->ops);
+
+			trace_adreno_input_hw_fence(drawobj->context->id, obj->ctxt_id,
+				obj->seq_no, obj->flags, (ops && ops->get_timeline_name) ?
+				ops->get_timeline_name(fence) : "unknown");
+		}
+#endif
 
 		obj->header = FIELD_PREP(GENMASK(15, 0), sizeof(*obj) >> 2);
 		obj++;

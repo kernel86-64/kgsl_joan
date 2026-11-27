@@ -205,8 +205,15 @@ static void syncobj_timer(struct timer_list *t)
 					&fence->flags);
 			const char *str = NULL;
 
-			if (fence->ops->signaled && fence->ops->signaled(fence))
-				retired = true;
+			rcu_read_lock();
+			{
+				const struct dma_fence_ops *ops =
+					rcu_dereference(fence->ops);
+
+				if (signaled || (ops && ops->signaled && ops->signaled(fence)))
+					retired = true;
+			}
+			rcu_read_unlock();
 
 			if (!retired)
 				str = "not retired";
@@ -307,9 +314,23 @@ static void trace_syncpoint_timeline_fence(struct kgsl_drawobj_sync *syncobj,
 	for (i = 0; i < num_fences; i++) {
 		char fence_name[KGSL_FENCE_NAME_LEN];
 
+#if (KERNEL_VERSION(7, 0, 0) <= LINUX_VERSION_CODE)
+		const char __rcu *timeline;
+
+		rcu_read_lock();
+		timeline = dma_fence_timeline_name(fences[i]);
 		snprintf(fence_name, sizeof(fence_name), "%s:%llu",
-			fences[i]->ops->get_timeline_name(fences[i]),
+			rcu_dereference(timeline),
 			fences[i]->seqno);
+		rcu_read_unlock();
+#else
+		const struct dma_fence_ops *ops = READ_ONCE(fences[i]->ops);
+
+		snprintf(fence_name, sizeof(fence_name), "%s:%llu",
+			(ops && ops->get_timeline_name) ?
+				ops->get_timeline_name(fences[i]) : "signaled-timeline",
+			fences[i]->seqno);
+#endif
 		if (expire) {
 			trace_syncpoint_fence_expire(syncobj, fence_name);
 			log_kgsl_syncpoint_fence_expire_event(
@@ -495,13 +516,22 @@ void kgsl_drawobj_destroy(struct kgsl_drawobj *drawobj)
 	kgsl_drawobj_put(drawobj);
 }
 
+static void drawobj_sync_fence_work(struct work_struct *work)
+{
+	struct kgsl_drawobj_sync_event *event = container_of(work,
+		struct kgsl_drawobj_sync_event, work);
+
+	kgsl_drawobj_put(&event->syncobj->base);
+}
+
 static bool drawobj_sync_fence_func(void *priv)
 {
 	struct kgsl_drawobj_sync_event *event = priv;
-	struct event_fence_info *info = event->priv;
+	struct event_fence_info *info = READ_ONCE(event->priv);
+	int num_fences = info ? smp_load_acquire(&info->num_fences) : 0;
 	int i;
 
-	for (i = 0; info && i < info->num_fences; i++) {
+	for (i = 0; i < num_fences; i++) {
 		trace_syncpoint_fence_expire(event->syncobj,
 			info->fences[i].name);
 		log_kgsl_syncpoint_fence_expire_event(
@@ -509,11 +539,13 @@ static bool drawobj_sync_fence_func(void *priv)
 	}
 
 	/*
-	 * Only call kgsl_drawobj_put() if it's not marked for cancellation
-	 * in another thread.
+	 * Only release the drawobj reference if it's not marked for cancellation
+	 * in another thread. Defer the put to workqueue context so
+	 * syncobj_destroy_object() never drops dma_fence/context references
+	 * inside a foreign dma_fence_signal_locked() IRQ callback.
 	 */
 	if (drawobj_sync_expire(event->device, event)) {
-		kgsl_drawobj_put(&event->syncobj->base);
+		queue_work(kgsl_driver.lockless_workqueue, &event->work);
 		return true;
 	}
 	return false;
@@ -643,14 +675,14 @@ static int drawobj_add_sync_fence(struct kgsl_device *device,
 	event->syncobj = syncobj;
 	event->device = device;
 	event->context = NULL;
+	INIT_WORK(&event->work, drawobj_sync_fence_work);
 
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	WRITE_ONCE(event->priv, priv);
 
 	set_bit(event->id, &syncobj->pending);
 
 	event->handle = kgsl_sync_fence_async_wait(sync.fd, drawobj_sync_fence_func, event);
-
-	event->priv = priv;
 
 	if (IS_ERR_OR_NULL(event->handle)) {
 		int ret = PTR_ERR(event->handle);
